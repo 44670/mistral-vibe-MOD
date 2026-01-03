@@ -182,7 +182,7 @@ class OpenAIAdapter(APIAdapter):
         if openrouter_pin_provider:
             payload["provider"] = {
                 "order": [openrouter_pin_provider],
-                "allowFallbacks": False,
+                "allow_fallbacks": False,
             }
 
         if enable_streaming:
@@ -421,13 +421,11 @@ class GenericBackend:
         self, url: str, data: bytes, headers: dict[str, str]
     ) -> HTTPResponse:
         client = self._get_client()
-        logger.info("LLM request url=%s body=%s", url, data.decode("utf-8", "replace"))
         response = await client.post(url, content=data, headers=headers)
         response.raise_for_status()
 
         response_headers = dict(response.headers.items())
         response_body = response.json()
-        logger.info("LLM response url=%s body=%s", url, response_body)
         emit_llm_log(
             streaming=False, request=data.decode("utf-8", "replace"), response=json.dumps(response_body)
         )
@@ -438,9 +436,6 @@ class GenericBackend:
         self, url: str, data: bytes, headers: dict[str, str]
     ) -> AsyncGenerator[dict[str, Any]]:
         client = self._get_client()
-        logger.info(
-            "LLM request (stream) url=%s body=%s", url, data.decode("utf-8", "replace")
-        )
         stream_chunks: list[str] = []
         async with client.stream(
             method="POST", url=url, content=data, headers=headers
@@ -467,7 +462,6 @@ class GenericBackend:
                     break
                 stream_chunks.append(value)
                 payload = json.loads(value.strip())
-                logger.info("LLM response (stream) url=%s body=%s", url, payload)
                 yield payload
         emit_llm_log(
             streaming=True,
