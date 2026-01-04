@@ -123,6 +123,7 @@ class SessionLoggingConfig(BaseSettings):
 class Backend(StrEnum):
     MISTRAL = auto()
     GENERIC = auto()
+    GEMINI = auto()
 
 
 class ProviderConfig(BaseModel):
@@ -405,7 +406,7 @@ class VibeConfig(BaseSettings):
                 provider.api_base.startswith(api_base) for api_base in MISTRAL_API_BASES
             )
             if (is_mistral_api and provider.backend != Backend.MISTRAL) or (
-                not is_mistral_api and provider.backend != Backend.GENERIC
+                not is_mistral_api and (provider.backend != Backend.GENERIC and provider.backend != Backend.GEMINI)
             ):
                 raise WrongBackendError(provider.backend, is_mistral_api)
 
