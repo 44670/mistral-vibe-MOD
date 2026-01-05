@@ -270,21 +270,58 @@ class GeminiBackend:
             headers.update(extra_headers)
         return headers
 
+    def _sanitize_schema(self, schema: Any) -> dict[str, Any] | Any:
+        """Reduce schemas to Gemini's supported subset."""
+        if not isinstance(schema, dict):
+            return schema
+
+        working = dict(schema)
+        working.pop("$defs", None)
+
+        if "anyOf" in working:
+            variants = working.get("anyOf") or []
+            non_null = [
+                variant
+                for variant in variants
+                if not (isinstance(variant, dict) and variant.get("type") == "null")
+            ]
+            chosen = non_null[0] if non_null else (variants[0] if variants else {})
+            working = chosen if isinstance(chosen, dict) else {}
+
+        working.pop("$ref", None)
+
+        allowed_keys = {"type", "properties", "items", "required", "enum", "description"}
+        sanitized: dict[str, Any] = {
+            key: value for key, value in working.items() if key in allowed_keys
+        }
+
+        if properties := sanitized.get("properties"):
+            if isinstance(properties, dict):
+                sanitized["properties"] = {
+                    name: self._sanitize_schema(prop_schema)
+                    for name, prop_schema in properties.items()
+                    if isinstance(prop_schema, (dict, list))
+                }
+            sanitized.setdefault("type", "object")
+
+        if "items" in sanitized and isinstance(sanitized["items"], (dict, list)):
+            sanitized["items"] = self._sanitize_schema(sanitized["items"])
+
+        return sanitized
+
     def _tool_definitions(self, tools: list[AvailableTool] | None) -> list[dict[str, Any]]:
         if not tools:
             return []
-        return [
+        # Gemini expects a single tools entry containing all declarations.
+        function_declarations = [
             {
-                "functionDeclarations": [
-                    {
-                        "name": tool.function.name,
-                        "description": tool.function.description,
-                        "parameters": tool.function.parameters,
-                    }
-                ]
+                "name": tool.function.name,
+                "description": tool.function.description,
+                "parameters": self._sanitize_schema(tool.function.parameters),
             }
             for tool in tools
         ]
+        return [{"functionDeclarations": function_declarations}]
 
     def _tool_config(
         self, tool_choice: StrToolChoice | AvailableTool | None
@@ -445,13 +482,7 @@ class GeminiBackend:
 
     def _parse_candidate(self, data: dict[str, Any]) -> LLMChunk:
         candidates = data.get("candidates") or []
-        if not candidates:
-            return LLMChunk(
-                message=LLMMessage(role=Role.assistant, content=""),
-                usage=LLMUsage(prompt_tokens=0, completion_tokens=0),
-            )
-
-        candidate = candidates[0] or {}
+        candidate = candidates[0] or {} if candidates else {}
         content = candidate.get("content") or {}
         parts = content.get("parts") or []
 
@@ -459,9 +490,14 @@ class GeminiBackend:
 
         message_text, tool_calls = self._parse_parts(parts)
         usage_meta = data.get("usageMetadata") or candidate.get("usageMetadata") or {}
+        prompt_tokens = usage_meta.get("promptTokenCount", 0)
+
+        completion_tokens = (
+            usage_meta.get("candidatesTokenCount", 0)
+        )
         usage = LLMUsage(
-            prompt_tokens=usage_meta.get("promptTokenCount", 0),
-            completion_tokens=usage_meta.get("candidatesTokenCount", 0),
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
         )
 
         return LLMChunk(
@@ -496,14 +532,12 @@ class GeminiBackend:
     ) -> AsyncGenerator[dict[str, Any], None]:
         request_payload = json.dumps(body, ensure_ascii=False)
         stream_chunks: list[str] = []
-        print(url, request_payload, headers, params)
         async with self._get_client().stream(
             "POST", url, json=body, headers=headers, params=params
         ) as response:
             response.raise_for_status()
-            print(response.status_code, response.headers)
             async for line in response.aiter_lines():
-                print(line)
+                emit_llm_log(streaming=True, request="123", response=line)
                 if not line:
                     continue
                 payload_str = line.removeprefix("data:").strip()
@@ -515,7 +549,7 @@ class GeminiBackend:
                 except json.JSONDecodeError:
                     if _logger:
                         _logger.debug("Skipping non-JSON stream chunk: %s", payload_str)
-        emit_llm_log(streaming=True, request=request_payload, response="\n".join(stream_chunks))
+        emit_llm_log(streaming=True, request=body, response="\n".join(stream_chunks))
 
     async def complete(
         self,
