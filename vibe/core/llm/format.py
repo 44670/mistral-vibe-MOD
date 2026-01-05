@@ -180,6 +180,7 @@ class APIToolFormatHandler:
                         "name": tc.function.name,
                         "arguments": tc.function.arguments,
                     },
+                    "thought_signature": tc.thought_signature,
                 }
                 for tc in message.tool_calls
             ]

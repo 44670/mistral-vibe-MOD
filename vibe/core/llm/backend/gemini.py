@@ -34,189 +34,6 @@ else:
     _logger = None
 
 
-class GeminiThoughtSignatureTracker:
-    """Preserve and re-attach Gemini 3 thought signatures across tool calls.
-
-    Gemini 3 requires the ``thoughtSignature`` attached to the first
-    ``functionCall`` part of every step to be echoed back in subsequent requests.
-    Dropping the signature causes a 4xx validation error. This helper records the
-    signature from a model response and can inject it back into the conversation
-    history before the next request is sent.
-    """
-
-    def __init__(self, *, prefer_snake_case: bool = False) -> None:
-        self._signatures: list[str] = []
-        self._prefer_snake_case = prefer_snake_case
-
-    def record_model_response(
-        self,
-        *,
-        parts: Sequence[Mapping[str, Any]] | None = None,
-        message: Mapping[str, Any] | None = None,
-    ) -> str | None:
-        """Capture the first thought signature from a model message.
-
-        Args:
-            parts: The ``parts`` array from a Gemini model response.
-            message: Full model message that contains ``parts``.
-
-        Returns:
-            The captured signature or ``None`` when no signature was found.
-        """
-        resolved_parts = self._resolve_parts(parts, message)
-        if not self._contains_function_call(resolved_parts):
-            return None
-
-        signature = self._find_first_signature(resolved_parts)
-        if signature:
-            self._signatures.append(signature)
-        return signature
-
-    def seed_from_history(self, contents: Sequence[Mapping[str, Any]]) -> None:
-        """Populate the tracker from an existing conversation history."""
-        for message in contents:
-            if message.get("role") != "model":
-                continue
-            self.record_model_response(parts=message.get("parts") or [])
-
-    def ensure_signatures(
-        self,
-        contents: Sequence[Mapping[str, Any]],
-        *,
-        prefer_snake_case: bool | None = None,
-    ) -> list[dict[str, Any]]:
-        """Return a copy of ``contents`` with required thought signatures attached."""
-        updated: list[dict[str, Any]] = []
-        signature_index = 0
-
-        for message in contents:
-            as_dict = dict(message)
-            role = as_dict.get("role")
-            parts = as_dict.get("parts") or []
-            if role != "model" or not self._contains_function_call(parts):
-                updated.append(deepcopy(as_dict))
-                continue
-
-            expected = (
-                self._signatures[signature_index]
-                if signature_index < len(self._signatures)
-                else None
-            )
-            signature_index += 1
-
-            updated_parts = self._attach_signature(
-                parts,
-                expected_signature=expected,
-                prefer_snake_case=prefer_snake_case,
-            )
-            updated.append({"role": role, "parts": updated_parts})
-
-        # Trim stale signatures when history is compacted or truncated
-        if signature_index < len(self._signatures):
-            self._signatures = self._signatures[:signature_index]
-
-        return updated
-
-    def reset(self) -> None:
-        self._signatures.clear()
-
-    @property
-    def signatures(self) -> list[str]:
-        """Return a copy of all captured signatures."""
-        return list(self._signatures)
-
-    def _resolve_parts(
-        self,
-        parts: Sequence[Mapping[str, Any]] | None,
-        message: Mapping[str, Any] | None,
-    ) -> list[Mapping[str, Any]]:
-        if parts is not None:
-            return list(parts)
-        if message is None:
-            raise ValueError("Either 'parts' or 'message' must be provided.")
-        resolved_parts = message.get("parts")
-        if resolved_parts is None:
-            raise ValueError("Gemini model message is missing the 'parts' field.")
-        return list(resolved_parts)
-
-    def _find_first_signature(
-        self, parts: Sequence[Mapping[str, Any]]
-    ) -> str | None:
-        for part in parts:
-            if not self._is_function_call(part):
-                continue
-            if signature := self._extract_signature(part):
-                return signature
-        return None
-
-    def _contains_function_call(self, parts: Sequence[Mapping[str, Any]]) -> bool:
-        return any(self._is_function_call(part) for part in parts)
-
-    def _attach_signature(
-        self,
-        parts: Sequence[Mapping[str, Any]],
-        *,
-        expected_signature: str | None,
-        prefer_snake_case: bool | None,
-    ) -> list[dict[str, Any]]:
-        updated_parts: list[dict[str, Any]] = []
-        signature_applied = False
-
-        for part in parts:
-            part_copy: dict[str, Any] = dict(part)
-            if not self._is_function_call(part_copy):
-                updated_parts.append(deepcopy(part_copy))
-                continue
-
-            if signature_applied:
-                updated_parts.append(deepcopy(part_copy))
-                continue
-
-            signature_applied = True
-            existing_signature = self._extract_signature(part_copy)
-            if existing_signature:
-                updated_parts.append(deepcopy(part_copy))
-                continue
-
-            if expected_signature is None:
-                raise ValueError(
-                    "Missing thought signature for Gemini function call step. "
-                    "Call 'record_model_response' with the previous model output "
-                    "before building the next request."
-                )
-
-            signature_key = self._signature_key(part_copy, prefer_snake_case)
-            part_copy[signature_key] = expected_signature
-            updated_parts.append(part_copy)
-
-        return updated_parts
-
-    @staticmethod
-    def _is_function_call(part: Mapping[str, Any]) -> bool:
-        return "functionCall" in part or "function_call" in part
-
-    @staticmethod
-    def _extract_signature(part: Mapping[str, Any]) -> str | None:
-        match part:
-            case {"thoughtSignature": str(signature)}:
-                return signature
-            case {"thought_signature": str(signature)}:
-                return signature
-        return None
-
-    def _signature_key(
-        self, part: Mapping[str, Any], prefer_snake_case: bool | None
-    ) -> str:
-        if "thoughtSignature" in part:
-            return "thoughtSignature"
-        if "thought_signature" in part:
-            return "thought_signature"
-
-        if prefer_snake_case is None:
-            prefer_snake_case = self._prefer_snake_case
-        return "thought_signature" if prefer_snake_case else "thoughtSignature"
-
-
 class GeminiBackend:
     """Native Gemini 3 backend with thought signature handling."""
 
@@ -229,7 +46,6 @@ class GeminiBackend:
             if self._provider.api_key_env_var
             else None
         )
-        self._tracker = GeminiThoughtSignatureTracker()
 
     async def __aenter__(self) -> "GeminiBackend":
         if self._client is None:
@@ -374,23 +190,30 @@ class GeminiBackend:
                     parts: list[dict[str, Any]] = []
                     if msg.tool_calls:
                         for idx, tc in enumerate(sorted(msg.tool_calls, key=lambda t: t.index or 0)):
+                            emit_llm_log(streaming=True, request="", response=f"tc send : {tc.thought_signature}")
                             args = tc.function.arguments or "{}"
                             try:
                                 parsed_args = json.loads(args)
                             except json.JSONDecodeError:
                                 parsed_args = {"_raw": args}
+                            function_call_payload = {
+                                "name": tc.function.name or "",
+                                "args": parsed_args,
+                                **({"id": tc.id} if tc.id else {}),
+                            }
                             parts.append(
                                 {
-                                    "functionCall": {
-                                        "name": tc.function.name or "",
-                                        "args": parsed_args,
-                                        **({"id": tc.id} if tc.id else {}),
-                                    }
+                                    "functionCall": function_call_payload,
+                                    **(
+                                        {"thoughtSignature": tc.thought_signature}
+                                        if tc.thought_signature
+                                        else {}
+                                    ),
                                 }
                             )
                             # Preserve index ordering hint if provided
-                            if tc.index is not None and parts[-1]["functionCall"].get("index") is None:
-                                parts[-1]["functionCall"]["index"] = tc.index
+                            #if tc.index is not None and parts[-1]["functionCall"].get("index") is None:
+                            #    parts[-1]["functionCall"]["index"] = tc.index
                     if msg.content:
                         parts.append({"text": msg.content})
                     contents.append({"role": "model", "parts": parts or [{"text": ""}]})
@@ -424,8 +247,7 @@ class GeminiBackend:
                         }
                     )
 
-        contents_with_signatures = self._tracker.ensure_signatures(contents)
-        return contents_with_signatures, system_instruction
+        return contents, system_instruction
 
     def _generation_body(
         self,
@@ -466,18 +288,21 @@ class GeminiBackend:
                 text_parts.append(part["text"])
             if "functionCall" in part:
                 fn_call = part["functionCall"] or {}
+                signature = part.get("thoughtSignature")
                 args_obj = fn_call.get("args", {})
                 args = json.dumps(args_obj) if not isinstance(args_obj, str) else args_obj
-                tool_calls.append(
-                    ToolCall(
-                        id=fn_call.get("id"),
-                        index=fn_call.get("index", idx),
-                        function=FunctionCall(
-                            name=fn_call.get("name"),
-                            arguments=args,
-                        ),
-                    )
+                tool_call = ToolCall(
+                    id=fn_call.get("id"),
+                    index=fn_call.get("index", idx),
+                    function=FunctionCall(
+                        name=fn_call.get("name"),
+                        arguments=args,
+                    ),
                 )
+                if signature:
+                    emit_llm_log(streaming=True, request="", response=f"thoughtSignature: {signature}")
+                    tool_call.thought_signature = signature
+                tool_calls.append(tool_call)
         return "".join(text_parts), tool_calls
 
     def _parse_candidate(self, data: dict[str, Any]) -> LLMChunk:
@@ -485,8 +310,6 @@ class GeminiBackend:
         candidate = candidates[0] or {} if candidates else {}
         content = candidate.get("content") or {}
         parts = content.get("parts") or []
-
-        self._tracker.record_model_response(parts=parts)
 
         message_text, tool_calls = self._parse_parts(parts)
         usage_meta = data.get("usageMetadata") or candidate.get("usageMetadata") or {}
@@ -520,7 +343,7 @@ class GeminiBackend:
         response = await self._get_client().post(url, json=body, headers=headers, params=params)
         response.raise_for_status()
         response_data = response.json()
-        emit_llm_log(streaming=False, request=request_payload, response=json.dumps(response_data, ensure_ascii=False))
+        emit_llm_log(streaming=False, request=body, response=json.dumps(response_data, ensure_ascii=False))
         return response_data
 
     async def _post_json_stream(
@@ -537,7 +360,6 @@ class GeminiBackend:
         ) as response:
             response.raise_for_status()
             async for line in response.aiter_lines():
-                emit_llm_log(streaming=True, request="123", response=line)
                 if not line:
                     continue
                 payload_str = line.removeprefix("data:").strip()
@@ -549,7 +371,9 @@ class GeminiBackend:
                 except json.JSONDecodeError:
                     if _logger:
                         _logger.debug("Skipping non-JSON stream chunk: %s", payload_str)
-        emit_llm_log(streaming=True, request=body, response="\n".join(stream_chunks))
+        emit_llm_log(
+            streaming=True, request=body, response="\n".join(stream_chunks)
+        )
 
     async def complete(
         self,

@@ -76,7 +76,7 @@ def _ensure_llm_log_file() -> Path:
     return _LLM_LOG_FILE
 
 
-def emit_llm_log(*, streaming: bool, request: str, response: str) -> None:
+def emit_llm_log(*, streaming: bool, request: Any, response: Any) -> None:
     log_path = _ensure_llm_log_file()
     try:
         with log_path.open("a", encoding="utf-8") as file:

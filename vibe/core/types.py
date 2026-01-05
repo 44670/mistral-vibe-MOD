@@ -131,6 +131,7 @@ class ToolCall(BaseModel):
     id: str | None = None
     index: int | None = None
     function: FunctionCall = Field(default_factory=FunctionCall)
+    thought_signature: str | None = Field(default=None)
     type: str = "function"
 
 
@@ -230,6 +231,11 @@ class LLMMessage(BaseModel):
                         tc.function.arguments or ""
                     )
                     tool_calls_map[tc.index].function.arguments = new_args
+                    if (
+                        tool_calls_map[tc.index].thought_signature is None
+                        and tc.thought_signature
+                    ):
+                        tool_calls_map[tc.index].thought_signature = tc.thought_signature
 
         return LLMMessage(
             role=self.role,
