@@ -176,8 +176,20 @@ class GeminiBackend:
     ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
         system_instruction, remaining = self._build_system_instruction(messages)
         contents: list[dict[str, Any]] = []
+        tool_response_parts: list[dict[str, Any]] = []
 
         for msg in remaining:
+            # Gemini requires that all function responses for a given function-call turn
+            # are sent together in a single "user" content, with the number of
+            # functionResponse parts matching the number of functionCall parts.
+            #
+            # Our internal message history stores each tool result as a separate
+            # Role.tool message, so we batch consecutive tool messages into one
+            # user content with multiple parts.
+            if msg.role != Role.tool and tool_response_parts:
+                contents.append({"role": "user", "parts": tool_response_parts})
+                tool_response_parts = []
+
             match msg.role:
                 case Role.user:
                     contents.append(
@@ -224,18 +236,13 @@ class GeminiBackend:
                             payload = json.loads(msg.content)
                         except json.JSONDecodeError:
                             payload = {"output": msg.content}
-                    contents.append(
+                    tool_response_parts.append(
                         {
-                            "role": "user",
-                            "parts": [
-                                {
-                                    "functionResponse": {
-                                        "name": msg.name or "",
-                                        "response": payload,
-                                        **({"id": msg.tool_call_id} if msg.tool_call_id else {}),
-                                    }
-                                }
-                            ],
+                            "functionResponse": {
+                                "name": msg.name or "",
+                                "response": payload,
+                                **({"id": msg.tool_call_id} if msg.tool_call_id else {}),
+                            }
                         }
                     )
                 case Role.system:
@@ -246,6 +253,9 @@ class GeminiBackend:
                             "parts": [{"text": msg.content or ""}],
                         }
                     )
+
+        if tool_response_parts:
+            contents.append({"role": "user", "parts": tool_response_parts})
 
         return contents, system_instruction
 
@@ -436,44 +446,18 @@ class GeminiBackend:
         tool_choice: StrToolChoice | AvailableTool | None,
         extra_headers: dict[str, str] | None,
     ) -> AsyncGenerator[LLMChunk, None]:
-        headers = self._headers(extra_headers)
-        params: dict[str, Any] = {"alt": "sse"}
-        body = self._generation_body(
+        # Gemini streaming SSE can be flaky across proxies and providers.
+        # We intentionally degrade "streaming" to a single non-streamed `generateContent`
+        # request, yielding exactly one chunk so the Agent's streaming UI remains usable.
+        yield await self.complete(
             model=model,
             messages=messages,
             temperature=temperature,
             tools=tools,
             max_tokens=max_tokens,
             tool_choice=tool_choice,
+            extra_headers=extra_headers,
         )
-        url = self._generation_url(model.name, stream=True)
-
-        try:
-            async for payload in self._post_json_stream(url, body, headers, params):
-                yield self._parse_candidate(payload)
-        except httpx.HTTPStatusError as e:
-            raise BackendErrorBuilder.build_http_error(
-                provider=self._provider.name,
-                endpoint=url,
-                response=e.response,
-                headers=e.response.headers,
-                model=model.name,
-                messages=messages,
-                temperature=temperature,
-                has_tools=bool(tools),
-                tool_choice=tool_choice,
-            ) from e
-        except httpx.RequestError as e:
-            raise BackendErrorBuilder.build_request_error(
-                provider=self._provider.name,
-                endpoint=url,
-                error=e,
-                model=model.name,
-                messages=messages,
-                temperature=temperature,
-                has_tools=bool(tools),
-                tool_choice=tool_choice,
-            ) from e
 
     async def count_tokens(
         self,
